@@ -1,0 +1,69 @@
+From Peter Cordes <pcordes@gmail.com>
+ * i7-6700k (EPP configured to only turbo up to 3.9GHz, TSC ticks at 4008MHz)
+ * GCC 12.2.1
+ * gcc -O3 -march=native -Wa,-mbranches-within-32B-boundaries -fno-tree-vectorize wpopcnt.c
+scalar popcnt   16651354844 - Cycles = 855747452
+scalar LUT      16651354844 - Cycles = 2061668050
+SSSE3           16651354844 - Cycles = 762539225
+bithack0        16651354844 - Cycles = 1412557641
+bithack1        16651354844 - Cycles = 1153155170
+bithack1a       16651354844 - Cycles = 910300012
+bithack2        16651354844 - Cycles = 1344193062
+
+ * clang 15.0.7
+ * clang -O3 -march=native -mbranches-within-32B-boundaries -fno-tree-vectorize wpopcnt.c
+scalar popcnt   16651354844 - Cycles = 873222479
+scalar LUT      16651354844 - Cycles = 2033048262
+SSSE3           16651354844 - Cycles = 786758849
+bithack0        16651354844 - Cycles = 1460598342
+bithack1        16651354844 - Cycles = 1237851038
+bithack1a       16651354844 - Cycles = 941879434
+bithack2        16651354844 - Cycles = 1399351601
+
+
+ **** With vectorization allowed after inlining ****
+* clang -O3 -march=native -mbranches-within-32B-boundaries wpopcnt.c
+scalar popcnt   16651354844 - Cycles = 549542548     # scalar popcount gets vectorized
+scalar LUT      16651354844 - Cycles = 2040610795
+SSSE3           16651354844 - Cycles = 788827462
+bithack0        16651354844 - Cycles = 414770586     # without multiplies, SIMD shifts do well
+bithack1        16651354844 - Cycles = 581111433
+bithack1a       16651354844 - Cycles = 494517106
+bithack2        16651354844 - Cycles = 468934817
+
+* gcc -O3 -march=native -Wa,-mbranches-within-32B-boundaries wpopcnt.c
+scalar popcnt   16651354844 - Cycles = 860359345       # GCC doesn't vectorize popcount
+scalar LUT      16651354844 - Cycles = 2070296217
+SSSE3           16651354844 - Cycles = 763931882
+bithack0        16651354844 - Cycles = 489211588
+bithack1        16651354844 - Cycles = 594417550
+bithack1a       16651354844 - Cycles = 480006664
+bithack2        16651354844 - Cycles = 498701858
+
+
+ *** Without hardware popcount (and without auto-vectorization) ***
+* gcc -O3 -march=core2 -mtune=skylake -Wa,-mbranches-within-32B-boundaries wpopcnt.c
+scalar popcnt   16651354844 - Cycles = 5400465450
+scalar LUT      16651354844 - Cycles = 2065261242
+SSSE3           16651354844 - Cycles = 772816528
+bithack0        16651354844 - Cycles = 1505002056
+bithack1        16651354844 - Cycles = 1155449085
+bithack1a       16651354844 - Cycles = 900851202    # about the same as normal
+bithack2        16651354844 - Cycles = 1341564965
+
+
+
+*** All above results are with  static inline,  so constants get hoisted out of loop ***
+** Without inlining or inter-procedural analysis (noipa)
+* gcc -O3 -march=native -Wa,-mbranches-within-32B-boundaries -fno-tree-vectorize wpopcnt.c
+scalar popcnt   16651354844 - Cycles = 1344190686
+scalar LUT      16651354844 - Cycles = 2222938406
+SSSE3           16651354844 - Cycles = 1135800575    # surprisingly good!
+bithack0        16651354844 - Cycles = 1556778199
+bithack1        16651354844 - Cycles = 1549597340
+bithack1a       16651354844 - Cycles = 1239980992    # faster than scalar popcnt masking 6 ways
+bithack2        16651354844 - Cycles = 1658991958
+
+This is still using n & 0xffffffff00000000  instead of n >> 32 in the scalar popcount version
+
+clang is about the same
