@@ -1,19 +1,26 @@
+// https://stackoverflow.com/questions/76139951/popcount-assembly-sum-indexes-of-set-bits
+// compile with gcc -O3 -march=native -fno-tree-vectorize  or it will defeat benchmarks
+// or 
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <xmmintrin.h>
 #include <immintrin.h>
 
+#define INLINE  static inline
+//#define INLINE __attribute__((noinline,noipa))
 
 uint64_t  get_cycles () {
-  uint32_t lo,hi;
-  asm  volatile("rdtsc":"=a"(lo),"=d"(hi));
-  return  (( uint64_t)hi<<32 | lo);
+	return __rdtsc();
+//  uint32_t lo,hi;   // clang does something weird with a multiply, perhaps trying to avoid extra work of zero-extending these asm outputs to 64-bit
+//                    // since we didn't tell the compiler they were already zero-extended to 64-bit.
+//  asm  volatile("rdtsc":"=a"(lo),"=d"(hi));
+//  return  (( uint64_t)hi<<32 | lo);
 }
 
-static inline uint32_t A073642(uint64_t n)
+INLINE uint32_t A073642(uint64_t n)
 {
 // Author: Unknown
     return __builtin_popcountll(n & 0xAAAAAAAAAAAAAAAA) +
@@ -24,7 +31,7 @@ static inline uint32_t A073642(uint64_t n)
           (__builtin_popcountll(n & 0xFFFFFFFF00000000) << 5);
 }
 
-static inline uint32_t A073642_nopopcnt(uint64_t n) {
+INLINE uint32_t A073642_nopopcnt(uint64_t n) {
   static const uint8_t nibbles[16][16] = {
 // Author: Simon Goater
 {0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6},
@@ -50,7 +57,7 @@ static inline uint32_t A073642_nopopcnt(uint64_t n) {
   return sumsetbitpos;
 }
 
-static inline uint64_t weighted_popcnt_SSE_lookup(const uint64_t n) {
+INLINE uint64_t weighted_popcnt_SSE_lookup(const uint64_t n) {
 
 // Author: Peter Cordes
     size_t i = 0;
@@ -116,14 +123,15 @@ Each nibble has a different weight, so scale each byte differently when or befor
     high = _mm_shuffle_epi32(weighted_nibblecounts, _MM_SHUFFLE(3,2, 3,2));  // pshufd, movhlps, or punpckhqdq
     weighted_nibblecounts = _mm_add_epi32(weighted_nibblecounts, high);
 
-    return _mm_cvtsi128_si32(weighted_nibblecounts);  // movd  extract the low nibble
+    // zero-extend to 64-bit so no movsxd is needed.  787505415 vs. 821540661 counts of the 4008MHz TSC on SKL at 3.9 GHz.  (i7-6700k)
+    return (unsigned)_mm_cvtsi128_si32(weighted_nibblecounts);  // movd  extract the low nibble
 
 
    // A different nibble interleave order, like 15,0, 14,1 etc. would make the max sum 225 (15*15), allowing psadbw for hsumming if we factor out the <<2
    // weighted_nibblecounts = _mm_sad_epu8(weighted_nibblecounts, _mm_setzero_si128());  // psadbw
 }
 
-static inline unsigned A073642_bithack0(uint64_t n)
+INLINE unsigned A073642_bithack0(uint64_t n)
 {
 // Author: Peter Cordes
     uint64_t ones = (n >> 1) & 0x5555555555555555;   // 0xaa>>1
@@ -151,7 +159,7 @@ static inline unsigned A073642_bithack0(uint64_t n)
     return ((uint32_t)(weighted_hexes>>32) + (uint32_t)weighted_hexes + (x32>>(32-5))) & 0xFFFF;
 }
 
-static inline unsigned A073642_bithack1(uint64_t n)
+INLINE unsigned A073642_bithack1(uint64_t n)
 {
     uint64_t ones = (n >> 1) & 0x5555555555555555;   // 0xaa>>1
     uint64_t pairs = n - ones;  // standard popcount within pairs, not weighted
@@ -179,7 +187,31 @@ static inline unsigned A073642_bithack1(uint64_t n)
     return weighted_sum_hexes + sum_weighted_quads + 8*octweight;
 }
 
-static inline unsigned A073642_bithack2(uint64_t n)
+INLINE unsigned A073642_bithack1a(uint64_t n)
+{
+    uint64_t ones = (n >> 1) & 0x5555555555555555;   // 0xaa>>1
+    uint64_t pairs = n - ones;  // standard popcount within pairs, not weighted
+
+    uint64_t weighted_pairs = ((ones + (ones>>2)) & 0x3333333333333333)
+        + ((pairs >> 2) & 0x3333333333333333) * 2;   // 0..6 range within 4-bit nibbles
+             // aka  (pairs>>1) & (0x3333333333333333<<1).  But x86-64 can efficiently use LEA to shift-and-add in one insn so it's better to shift to match the same mask.
+    uint64_t quads = (pairs & 0x3333333333333333) + ((pairs >> 2) & 0x3333333333333333);   // standard popcount within each nibble, 0..4
+     
+    // reduce weighted pairs (0xaa and 0xcc masks) and add __popcnt64(n & 0xF0F0F0F0F0F0F0F0) << 2)
+    // resulting in 8 buckets of weighted sums, each a byte wide
+    uint64_t weighted_quads = ((weighted_pairs + (weighted_pairs >> 4)) & 0x0F0F0F0F0F0F0F0F) 
+              + (4*((quads >> 4) & 0x0F0F0F0F0F0F0F0F));  // 0 to 2*6 + 4*4 = 28 value-range
+                // need some masking before adding.  4*quads can be up to 16 so can't use (quads >> (4-2)) & 0x0F0F0F0F0F0F0F0F
+    uint64_t octs = (quads + (quads >> 4)) & 0x0F0F0F0F0F0F0F0F;  //  0..8   quad fields don't have their high bit set, so we can defer masking until after adding without overflow into next field
+
+    // two separate sums of 8-bit groups, one of the first 3 weights
+    unsigned sum_weighted_quads = (weighted_quads * 0x0101010101010101uLL)>>(64-8); // barely fits in 1 byte: max val 28 * 8 = 224
+    // the second applying the last 3 relative weights to the flat sums
+    unsigned sum_octweights = (octs * 0x0001020304050607uLL) >> (64-8);  // separate weight for each byte group, with <<3 factored out so the max sum is also 224 = 32*(1<<0 + 1<<1 + 1<<2)
+    return sum_weighted_quads + 8 * sum_octweights; // apply the <<3 factored out of byte weights
+}
+
+INLINE unsigned A073642_bithack2(uint64_t n)
 {
 // Author: Peter Cordes
     uint64_t ones = (n >> 1) & 0x5555555555555555;   // 0xaa>>1
@@ -208,11 +240,12 @@ static inline unsigned A073642_bithack2(uint64_t n)
 
 int main(int argc, char **argv)
 {
-  uint64_t ntemp, n = atol(argv[1]);
+  uint64_t ntemp, n = argc;
+  if (argc == 2)       // allow it to run without args, while still giving the compiler a value that isn't a known constant
+	  n = atol(argv[1]);
   uint32_t i, j, jtemp, k, sum, bitindex;
   uint64_t cycles1, cycles2;
-  uint64_t wpop, iter;
-  iter = 100000000;
+  uint64_t wpop, iter = 100000000;
   ntemp = n;
   wpop = 0;
   cycles1 = get_cycles ();
@@ -221,7 +254,7 @@ int main(int argc, char **argv)
     ntemp++;
   }
   cycles2 = get_cycles ();
-  printf("%li - Cycles = %li\n", wpop, cycles2 - cycles1);
+  printf("scalar popcnt \t%li - Cycles = %li\n", wpop, cycles2 - cycles1);
   ntemp = n;
   wpop = 0;
   cycles1 = get_cycles ();
@@ -230,7 +263,7 @@ int main(int argc, char **argv)
     ntemp++;
   }
   cycles2 = get_cycles ();
-  printf("%li - Cycles = %li\n", wpop, cycles2 - cycles1);
+  printf("scalar LUT \t%li - Cycles = %li\n", wpop, cycles2 - cycles1);
   ntemp = n;
   wpop = 0;
   cycles1 = get_cycles ();
@@ -239,7 +272,7 @@ int main(int argc, char **argv)
     ntemp++;
   }
   cycles2 = get_cycles ();
-  printf("%li - Cycles = %li\n", wpop, cycles2 - cycles1);
+  printf("SSSE3      \t%li - Cycles = %li\n", wpop, cycles2 - cycles1);
   ntemp = n;
   wpop = 0;
   cycles1 = get_cycles ();
@@ -248,7 +281,7 @@ int main(int argc, char **argv)
     ntemp++;
   }
   cycles2 = get_cycles ();
-  printf("%li - Cycles = %li\n", wpop, cycles2 - cycles1);
+  printf("bithack0\t%li - Cycles = %li\n", wpop, cycles2 - cycles1);
   ntemp = n;
   wpop = 0;
   cycles1 = get_cycles ();
@@ -257,7 +290,16 @@ int main(int argc, char **argv)
     ntemp++;
   }
   cycles2 = get_cycles ();
-  printf("%li - Cycles = %li\n", wpop, cycles2 - cycles1);
+  printf("bithack1\t%li - Cycles = %li\n", wpop, cycles2 - cycles1);
+  ntemp = n;
+  wpop = 0;
+  cycles1 = get_cycles ();
+  for (i=0; i<iter; i++) {
+    wpop += A073642_bithack1a(ntemp);
+    ntemp++;
+  }
+  cycles2 = get_cycles ();
+  printf("bithack1a\t%li - Cycles = %li\n", wpop, cycles2 - cycles1);
   ntemp = n;
   wpop = 0;
   cycles1 = get_cycles ();
@@ -266,7 +308,7 @@ int main(int argc, char **argv)
     ntemp++;
   }
   cycles2 = get_cycles ();
-  printf("%li - Cycles = %li\n", wpop, cycles2 - cycles1);
+  printf("bithack2\t%li - Cycles = %li\n", wpop, cycles2 - cycles1);
   exit(0);
   /*
   printf("{");
